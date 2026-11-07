@@ -1,0 +1,400 @@
+openapi: 3.0.3
+info:
+  title: Nugget Dashboard & Agent API
+  description: >
+    API contract governing communication between the Nugget Dashboard control plane
+    and distributed host agents. Covers machine pairing, authentication, periodic
+    heartbeats, and remote asynchronous job queue execution.
+  version: 0.5.0
+
+servers:
+  - url: http://localhost:3000
+    description: Nugget Dashboard server
+
+paths:
+  /api/agent/pair:
+    post:
+      summary: Pair Machine with Dashboard
+      description: Exchanges a temporary dashboard-generated pairing token for a permanent machine API key.
+      operationId: pairMachine
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PairRequest"
+      responses:
+        "200":
+          description: Machine paired successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/agent/heartbeat:
+    post:
+      summary: Send Agent Heartbeat & Metrics
+      description: Posts periodic machine utilization metrics and application statuses to update online state.
+      operationId: sendHeartbeat
+      security:
+        - MachineAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HeartbeatPayload"
+      responses:
+        "200":
+          description: Heartbeat recorded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HeartbeatResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/agent/jobs:
+    get:
+      summary: Poll Assigned Jobs
+      description: Retrieves queued remote execution jobs assigned to this machine.
+      operationId: pollJobs
+      security:
+        - MachineAuth: []
+      responses:
+        "200":
+          description: List of pending jobs.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Job"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/agent/jobs/{id}/status:
+    post:
+      summary: Update Job Execution Status
+      description: Reports progress, logs, success or error for an active job.
+      operationId: updateJobStatus
+      security:
+        - MachineAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JobStatusUpdate"
+      responses:
+        "200":
+          description: Job status updated.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/machines:
+    get:
+      summary: List Registered Machines
+      description: Dashboard endpoint listing all paired machines and their current statuses.
+      operationId: listMachines
+      responses:
+        "200":
+          description: List of machines.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Machine"
+
+  /api/machines/pairing-token:
+    post:
+      summary: Generate Pairing Token
+      description: Creates a short-lived (10 minute) pairing token used to connect a new machine.
+      operationId: createPairingToken
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                machineName:
+                  type: string
+      responses:
+        "201":
+          description: Pairing token created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairingTokenResponse"
+
+  /api/machines/{id}:
+    get:
+      summary: Get Machine Details
+      description: Retrieves complete status, specifications, and applications for a machine.
+      operationId: getMachine
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Machine details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Machine"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    delete:
+      summary: Disconnect Machine
+      description: Disconnects a machine and revokes its access credentials.
+      operationId: disconnectMachine
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Machine disconnected and credentials revoked.
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/machines/{id}/jobs:
+    post:
+      summary: Queue Remote Job
+      description: Dispatches a new deployment, restart, stop, or remove job for the target machine.
+      operationId: queueJob
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateJobRequest"
+      responses:
+        "201":
+          description: Job successfully queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+
+components:
+  securitySchemes:
+    MachineAuth:
+      type: http
+      scheme: bearer
+      description: Machine API key assigned during pairing.
+
+  responses:
+    BadRequest:
+      description: Invalid request payload.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid credentials.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    PairRequest:
+      type: object
+      required:
+        - token
+        - machineId
+        - machineName
+      properties:
+        token:
+          type: string
+        machineId:
+          type: string
+        machineName:
+          type: string
+        system:
+          type: object
+
+    PairResponse:
+      type: object
+      required:
+        - apiKey
+        - machineId
+        - machineName
+      properties:
+        apiKey:
+          type: string
+        machineId:
+          type: string
+        machineName:
+          type: string
+
+    HeartbeatPayload:
+      type: object
+      required:
+        - machineId
+        - timestamp
+      properties:
+        machineId:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        metrics:
+          type: object
+        applications:
+          type: array
+          items:
+            type: object
+
+    HeartbeatResponse:
+      type: object
+      required:
+        - status
+        - acknowledgedAt
+      properties:
+        status:
+          type: string
+          example: "ok"
+        acknowledgedAt:
+          type: string
+          format: date-time
+
+    Job:
+      type: object
+      required:
+        - id
+        - machineId
+        - type
+        - status
+      properties:
+        id:
+          type: string
+        machineId:
+          type: string
+        type:
+          type: string
+          enum: [deploy, restart, stop, remove]
+        payload:
+          type: object
+        status:
+          type: string
+          enum: [pending, running, completed, failed]
+        progress:
+          type: integer
+        error:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+
+    JobStatusUpdate:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum: [running, completed, failed]
+        progress:
+          type: integer
+        error:
+          type: string
+        result:
+          type: object
+
+    CreateJobRequest:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum: [deploy, restart, stop, remove]
+        payload:
+          type: object
+
+    PairingTokenResponse:
+      type: object
+      required:
+        - token
+        - expiresAt
+      properties:
+        token:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+
+    Machine:
+      type: object
+      required:
+        - id
+        - machineId
+        - name
+        - status
+      properties:
+        id:
+          type: string
+        machineId:
+          type: string
+        name:
+          type: string
+        status:
+          type: string
+          enum: [online, offline, disconnected]
+        os:
+          type: string
+        arch:
+          type: string
+        cpuCount:
+          type: integer
+        totalRamBytes:
+          type: integer
+          format: int64
+        totalDiskBytes:
+          type: integer
+          format: int64
+        lastHeartbeat:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+

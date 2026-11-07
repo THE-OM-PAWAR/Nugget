@@ -176,11 +176,18 @@ func (d *Deployer) Deploy(ctx context.Context, opts DeployOptions) (*store.Deplo
 
 	var buildLog bytes.Buffer
 	fmt.Fprintf(out, "      Image Tag: %s\n", imageTag)
-	if err := d.DockerClient.BuildImage(ctx, sourceDir, spec.DockerfilePath, imageTag, &buildLog); err != nil {
-		dep.Log = buildLog.String()
-		return d.failDeployment(dep, err, "build failed")
-	}
+	buildErr := d.DockerClient.BuildImage(ctx, sourceDir, spec.DockerfilePath, imageTag, &buildLog)
 	dep.Log = buildLog.String()
+
+	// Persist build logs to disk for debugging
+	logDir := filepath.Join(d.Store.DataDir, "apps", app.ID, "logs")
+	_ = os.MkdirAll(logDir, 0755)
+	_ = os.WriteFile(filepath.Join(logDir, fmt.Sprintf("build-%s.log", dep.ID)), buildLog.Bytes(), 0644)
+	_ = os.WriteFile(filepath.Join(logDir, "latest-build.log"), buildLog.Bytes(), 0644)
+
+	if buildErr != nil {
+		return d.failDeployment(dep, buildErr, "build failed")
+	}
 
 	// Step 4: Configure Reverse Proxy Network & Routing
 	fmt.Fprintf(out, "\n[4/5] Configuring reverse proxy & networking...\n")
@@ -234,6 +241,8 @@ func (d *Deployer) Deploy(ctx context.Context, opts DeployOptions) (*store.Deplo
 
 	containerID, err := d.DockerClient.RunContainer(ctx, runOpts)
 	if err != nil {
+		// Clean up any partially created or conflicting container
+		_ = d.DockerClient.StopAndRemoveContainer(ctx, containerName)
 		return d.failDeployment(dep, err, "container start failed")
 	}
 
@@ -354,5 +363,14 @@ func (d *Deployer) failDeployment(dep *store.Deployment, err error, reason strin
 	dep.Error = fmt.Sprintf("%s: %v", reason, err)
 	dep.CompletedAt = time.Now().UTC()
 	_ = d.Store.SaveDeployment(dep)
+
+	// Update app status if it has no active running container
+	if app, getErr := d.Store.GetApplication(dep.AppID); getErr == nil {
+		if app.ActiveContainerID == "" {
+			app.Status = "failed"
+			_ = d.Store.SaveApplication(app)
+		}
+	}
+
 	return dep, fmt.Errorf("%s: %w", reason, err)
 }

@@ -70,7 +70,17 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
+// SupportsBuildx checks whether the Docker buildx plugin is installed and operational.
+func (c *Client) SupportsBuildx(ctx context.Context) bool {
+	checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(checkCtx, c.DockerPath, "buildx", "version")
+	return cmd.Run() == nil
+}
+
 // BuildImage executes `docker build` safely with timeout and output streaming.
+// It prefers BuildKit/buildx when available to avoid legacy builder deprecation warnings,
+// falling back safely to standard docker build if buildx is not present.
 func (c *Client) BuildImage(ctx context.Context, buildDir, dockerfilePath, imageTag string, logOut io.Writer) error {
 	if buildDir == "" {
 		return errors.New("build directory cannot be empty")
@@ -84,17 +94,31 @@ func (c *Client) BuildImage(ctx context.Context, buildDir, dockerfilePath, image
 		return fmt.Errorf("dockerfile not found at %s: %w", fullDockerfilePath, err)
 	}
 
-	args := []string{
-		"build",
-		"-f", fullDockerfilePath,
-		"-t", imageTag,
-		buildDir,
-	}
-
 	buildCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 
+	hasBuildx := c.SupportsBuildx(buildCtx)
+
+	var args []string
+	if hasBuildx {
+		args = []string{
+			"buildx", "build",
+			"--load",
+			"-f", fullDockerfilePath,
+			"-t", imageTag,
+			buildDir,
+		}
+	} else {
+		args = []string{
+			"build",
+			"-f", fullDockerfilePath,
+			"-t", imageTag,
+			buildDir,
+		}
+	}
+
 	cmd := exec.CommandContext(buildCtx, c.DockerPath, args...)
+	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
 
 	var buf bytes.Buffer
 	var writer io.Writer = &buf
@@ -106,6 +130,30 @@ func (c *Client) BuildImage(ctx context.Context, buildDir, dockerfilePath, image
 	cmd.Stderr = writer
 
 	if err := cmd.Run(); err != nil {
+		// If buildx failed, try fallback to standard build with BuildKit
+		if hasBuildx {
+			fallbackArgs := []string{
+				"build",
+				"-f", fullDockerfilePath,
+				"-t", imageTag,
+				buildDir,
+			}
+			fallbackCmd := exec.CommandContext(buildCtx, c.DockerPath, fallbackArgs...)
+			fallbackCmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
+
+			var fallbackBuf bytes.Buffer
+			var fallbackWriter io.Writer = &fallbackBuf
+			if logOut != nil {
+				fallbackWriter = io.MultiWriter(&fallbackBuf, logOut)
+			}
+			fallbackCmd.Stdout = fallbackWriter
+			fallbackCmd.Stderr = fallbackWriter
+
+			if fallbackErr := fallbackCmd.Run(); fallbackErr == nil {
+				return nil
+			}
+		}
+
 		if buildCtx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("docker build timed out after 15 minutes")
 		}
