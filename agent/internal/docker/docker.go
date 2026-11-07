@@ -22,10 +22,13 @@ type RunOptions struct {
 	ContainerName string
 	HostPort      int
 	ContainerPort int
+	Ports         []string
+	Volumes       []string
 	Env           map[string]string
 	RestartPolicy string
 	Labels        map[string]string
 	Network       string
+	Cmd           []string
 }
 
 // ContainerState represents the operational status of a container from docker inspect.
@@ -42,6 +45,21 @@ type ContainerState struct {
 		StartedAt  string `json:"StartedAt"`
 		FinishedAt string `json:"FinishedAt"`
 	} `json:"State"`
+	Config struct {
+		Cmd    []string          `json:"Cmd"`
+		Image  string            `json:"Image"`
+		Labels map[string]string `json:"Labels"`
+	} `json:"Config"`
+	HostConfig struct {
+		Binds []string `json:"Binds"`
+	} `json:"HostConfig"`
+	Mounts []struct {
+		Type        string `json:"Type"`
+		Source      string `json:"Source"`
+		Destination string `json:"Destination"`
+		Mode        string `json:"Mode"`
+		RW          bool   `json:"RW"`
+	} `json:"Mounts"`
 }
 
 // Client wraps safe interactions with the Docker CLI.
@@ -184,6 +202,18 @@ func (c *Client) RunContainer(ctx context.Context, opts RunOptions) (string, err
 		args = append(args, "-p", fmt.Sprintf("%d:%d", opts.HostPort, opts.ContainerPort))
 	}
 
+	for _, p := range opts.Ports {
+		if p != "" {
+			args = append(args, "-p", p)
+		}
+	}
+
+	for _, v := range opts.Volumes {
+		if v != "" {
+			args = append(args, "-v", v)
+		}
+	}
+
 	if opts.Network != "" {
 		args = append(args, "--network", opts.Network)
 	}
@@ -217,6 +247,9 @@ func (c *Client) RunContainer(ctx context.Context, opts RunOptions) (string, err
 	}
 
 	args = append(args, opts.ImageTag)
+	if len(opts.Cmd) > 0 {
+		args = append(args, opts.Cmd...)
+	}
 
 	runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()

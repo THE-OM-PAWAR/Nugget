@@ -17,6 +17,7 @@ const (
 	TraefikImage         = "traefik:v3.1"
 	TraefikHTTPPort      = 80
 	TraefikDashboardPort = 8080
+	DockerSocketMount    = "/var/run/docker.sock:/var/run/docker.sock:ro"
 )
 
 // ProxyStatus describes the operational state of the Traefik reverse proxy.
@@ -26,6 +27,60 @@ type ProxyStatus struct {
 	Network     string `json:"network"`
 	BaseDomain  string `json:"base_domain"`
 	Details     string `json:"details"`
+}
+
+// RequiredTraefikArgs returns the essential command-line arguments needed by Traefik
+// to discover Docker containers with labels and route HTTP traffic.
+func RequiredTraefikArgs(networkName string) []string {
+	if networkName == "" {
+		networkName = DefaultNetwork
+	}
+	return []string{
+		"--providers.docker=true",
+		"--providers.docker.exposedbydefault=false",
+		fmt.Sprintf("--providers.docker.network=%s", networkName),
+		"--entrypoints.web.address=:80",
+		"--api.dashboard=true",
+		"--api.insecure=false",
+	}
+}
+
+// IsTraefikConfigValid verifies that an existing Traefik container was started with
+// all required Docker provider flags, entrypoint settings, and read-only socket mount.
+func IsTraefikConfigValid(state *docker.ContainerState, networkName string) bool {
+	if state == nil || !state.State.Running {
+		return false
+	}
+
+	requiredArgs := RequiredTraefikArgs(networkName)
+	cmdMap := make(map[string]bool)
+	for _, arg := range state.Config.Cmd {
+		cmdMap[arg] = true
+	}
+	for _, req := range requiredArgs {
+		if !cmdMap[req] {
+			return false
+		}
+	}
+
+	// Verify read-only docker socket mount
+	hasSocketMount := false
+	for _, m := range state.Mounts {
+		if m.Destination == "/var/run/docker.sock" && (!m.RW || m.Mode == "ro") {
+			hasSocketMount = true
+			break
+		}
+	}
+	if !hasSocketMount {
+		for _, b := range state.HostConfig.Binds {
+			if strings.HasSuffix(b, ":/var/run/docker.sock:ro") || b == DockerSocketMount {
+				hasSocketMount = true
+				break
+			}
+		}
+	}
+
+	return hasSocketMount
 }
 
 // GetBaseDomain returns the configured base domain, falling back to DefaultBaseDomain.
@@ -58,8 +113,8 @@ func GenerateTraefikLabels(appName, baseDomain string, containerPort int) map[st
 
 	return map[string]string{
 		"traefik.enable": "true",
-		fmt.Sprintf("traefik.http.routers.%s.rule", routerName):       fmt.Sprintf("Host(`%s`)", hostname),
-		fmt.Sprintf("traefik.http.routers.%s.entrypoints", routerName): "web",
+		fmt.Sprintf("traefik.http.routers.%s.rule", routerName):                        fmt.Sprintf("Host(`%s`)", hostname),
+		fmt.Sprintf("traefik.http.routers.%s.entrypoints", routerName):                 "web",
 		fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.port", serviceName): fmt.Sprintf("%d", containerPort),
 		"traefik.docker.network": DefaultNetwork,
 	}
@@ -117,32 +172,42 @@ func InspectProxyStatus(ctx context.Context, dClient *docker.Client, baseDomain 
 		if len(status.ContainerID) > 12 {
 			status.ContainerID = status.ContainerID[:12]
 		}
-		status.Details = "Traefik reverse proxy is active and routing requests on port 80."
+		if IsTraefikConfigValid(state, DefaultNetwork) {
+			status.Details = "Traefik reverse proxy is active and routing requests on port 80 with Docker provider."
+		} else {
+			status.Details = "Traefik reverse proxy is running with legacy/outdated configuration."
+		}
 	}
 
 	return status
 }
 
-// EnsureProxyRunning ensures the Docker network exists and Traefik container is running.
+// EnsureProxyRunning ensures the Docker network exists and Traefik container is running
+// with the Docker provider and HTTP entrypoints enabled.
+// If an existing container has outdated configuration, it reconciles by stopping and
+// recreating only the Traefik container while preserving all networks and application data.
 func EnsureProxyRunning(ctx context.Context, dClient *docker.Client, dataDir, baseDomain string) error {
-	// 1. Ensure docker network
+	// 1. Ensure docker network exists (preserves existing network)
 	if err := dClient.EnsureNetwork(ctx, DefaultNetwork); err != nil {
 		return fmt.Errorf("failed to ensure proxy network: %w", err)
 	}
 
-	// 2. Check if Traefik is already running
+	// 2. Check if Traefik container already exists and verify configuration
 	state, err := dClient.InspectContainer(ctx, ProxyContainerName)
-	if err == nil && state.State.Running {
-		return nil
+	if err == nil {
+		if state.State.Running && IsTraefikConfigValid(state, DefaultNetwork) {
+			// Proxy is already running with correct configuration
+			return nil
+		}
+		// Existing container is either stopped or has outdated configuration
+		// Stop and remove ONLY the existing Traefik container
+		_ = dClient.StopAndRemoveContainer(ctx, ProxyContainerName)
 	}
-
-	// Stop any stale stopped container
-	_ = dClient.StopAndRemoveContainer(ctx, ProxyContainerName)
 
 	dynamicDir := filepath.Join(dataDir, "proxy", "dynamic")
 	_ = os.MkdirAll(dynamicDir, 0755)
 
-	// Run Traefik container
+	// 3. Launch Traefik with required Docker provider configuration
 	runOpts := docker.RunOptions{
 		ImageTag:      TraefikImage,
 		ContainerName: ProxyContainerName,
@@ -150,6 +215,8 @@ func EnsureProxyRunning(ctx context.Context, dClient *docker.Client, dataDir, ba
 		ContainerPort: TraefikHTTPPort,
 		Network:       DefaultNetwork,
 		RestartPolicy: "unless-stopped",
+		Volumes:       []string{DockerSocketMount},
+		Cmd:           RequiredTraefikArgs(DefaultNetwork),
 		Labels: map[string]string{
 			"nugget.managed": "true",
 			"nugget.role":    "proxy",
@@ -161,6 +228,11 @@ func EnsureProxyRunning(ctx context.Context, dClient *docker.Client, dataDir, ba
 		return fmt.Errorf("failed to start Traefik reverse proxy: %w", err)
 	}
 
+	// 4. Verify that it is running
+	verifyState, err := dClient.InspectContainer(ctx, ProxyContainerName)
+	if err != nil || !verifyState.State.Running {
+		return fmt.Errorf("failed to verify Traefik reverse proxy is running after startup")
+	}
+
 	return nil
 }
-

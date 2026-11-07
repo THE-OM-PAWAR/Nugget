@@ -10,7 +10,6 @@ build/
 dist/
 
 # Production & Local Environment Variables
-.env
 .env*.local
 !.env.example
 *.env
@@ -42,7 +41,6 @@ lerna-debug.log*
 ehthumbs.db
 Thumbs.db
 .idea/
-.vscode/
 *.swp
 *.swo
 *~
@@ -50,3 +48,4 @@ Thumbs.db
 # TypeScript
 *.tsbuildinfo
 
+config.bat
